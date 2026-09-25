@@ -1,0 +1,13 @@
+spring:
+  cloud:
+    gateway:
+      routes:
+        - id: employee-service
+          uri: http://employee-service:8080
+          predicates:
+            - Path=/api/employees/**
+
+        - id: leave-service
+          uri: http://leave-service:8080
+          predicates:
+            - Path=/api/leaves/**
