@@ -48,6 +48,39 @@ pipeline {
             }
         }
 
+        stage('Plan Jenkins VPC infrastructure') {
+            steps {
+                dir('Terra_Jenkins') {
+                    sh '''
+                        set -eu
+                        terraform init -input=false
+                        terraform validate
+                        terraform plan -input=false -out=tfplan
+                    '''
+                }
+            }
+        }
+
+        stage('Approve Jenkins VPC changes') {
+            steps {
+                input message: 'Apply the Terraform plan for the Jenkins VPC and publish its outputs for EKS?',
+                      ok: 'Apply Jenkins VPC changes'
+            }
+        }
+
+        stage('Apply Jenkins VPC infrastructure') {
+            steps {
+                dir('Terra_Jenkins') {
+                    sh '''
+                        set -eu
+                        terraform apply -input=false -auto-approve tfplan
+                        terraform output -raw vpc_id
+                        terraform output -json public_subnet_ids
+                    '''
+                }
+            }
+        }
+
         stage('Terraform plan') {
             steps {
                 dir('EKS_Infra_terraform') {
