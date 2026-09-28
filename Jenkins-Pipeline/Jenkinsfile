@@ -1,0 +1,177 @@
+// Jenkins agent requirements: Linux, Docker, AWS CLI, Terraform, kubectl,
+// and an IAM role able to provision the EKS infrastructure and push to ECR.
+// The Terraform S3 state bucket must exist before this pipeline runs.
+// Configure Secret Text credentials: hrm-db-url, hrm-db-username, hrm-db-password.
+pipeline {
+    agent any
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+    }
+
+    environment {
+        AWS_REGION = 'us-east-1'
+        AWS_DEFAULT_REGION = 'us-east-1'
+        EKS_CLUSTER_NAME = 'my-eks-cluster'
+        K8S_NAMESPACE = 'hrm'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Validate agent and AWS access') {
+            steps {
+                sh '''
+                    set -eu
+                    command -v aws
+                    command -v terraform
+                    command -v kubectl
+                    command -v docker
+                    aws sts get-caller-identity
+                '''
+                script {
+                    env.IMAGE_TAG = sh(
+                        script: 'git rev-parse --short=12 HEAD',
+                        returnStdout: true
+                    ).trim()
+                    env.AWS_ACCOUNT_ID = sh(
+                        script: 'aws sts get-caller-identity --query Account --output text',
+                        returnStdout: true
+                    ).trim()
+                    env.ECR_REGISTRY = "${env.AWS_ACCOUNT_ID}.dkr.ecr.${env.AWS_REGION}.amazonaws.com"
+                }
+            }
+        }
+
+        stage('Terraform plan') {
+            steps {
+                dir('EKS_Infra_terraform') {
+                    sh '''
+                        set -eu
+                        terraform init -input=false
+                        terraform validate
+                        terraform plan -input=false -out=tfplan
+                    '''
+                }
+            }
+        }
+
+        stage('Approve infrastructure changes') {
+            steps {
+                input message: 'Apply the Terraform plan to AWS and create/update the EKS infrastructure?',
+                      ok: 'Apply infrastructure'
+            }
+        }
+
+        stage('Terraform apply') {
+            steps {
+                dir('EKS_Infra_terraform') {
+                    sh 'terraform apply -input=false -auto-approve tfplan'
+                }
+            }
+        }
+
+        stage('Connect to EKS') {
+            steps {
+                sh '''
+                    set -eu
+                    aws eks update-kubeconfig --region "$AWS_REGION" --name "$EKS_CLUSTER_NAME"
+                    kubectl get nodes
+                '''
+            }
+        }
+
+        stage('Build and push images') {
+            steps {
+                sh '''
+                    set -eu
+                    for repository in api-gateway employee-service leave-service; do
+                        if ! aws ecr describe-repositories --repository-names "$repository" >/dev/null 2>&1; then
+                            aws ecr create-repository \
+                                --repository-name "$repository" \
+                                --image-scanning-configuration scanOnPush=true >/dev/null
+                        fi
+                    done
+
+                    aws ecr get-login-password --region "$AWS_REGION" |
+                        docker login --username AWS --password-stdin "$ECR_REGISTRY"
+
+                    docker build -t "$ECR_REGISTRY/api-gateway:$IMAGE_TAG" ApiGatway
+                    docker build -t "$ECR_REGISTRY/employee-service:$IMAGE_TAG" EmployeManagementSystem
+                    docker build -t "$ECR_REGISTRY/leave-service:$IMAGE_TAG" LeaveService
+
+                    docker push "$ECR_REGISTRY/api-gateway:$IMAGE_TAG"
+                    docker push "$ECR_REGISTRY/employee-service:$IMAGE_TAG"
+                    docker push "$ECR_REGISTRY/leave-service:$IMAGE_TAG"
+                '''
+            }
+        }
+
+        stage('Deploy Spring services') {
+            steps {
+                withCredentials([
+                    string(credentialsId: 'hrm-db-url', variable: 'SPRING_DATASOURCE_URL'),
+                    string(credentialsId: 'hrm-db-username', variable: 'SPRING_DATASOURCE_USERNAME'),
+                    string(credentialsId: 'hrm-db-password', variable: 'SPRING_DATASOURCE_PASSWORD')
+                ]) {
+                    sh '''
+                        set -eu
+                        set +x
+
+                        kubectl create namespace "$K8S_NAMESPACE" \
+                            --dry-run=client -o yaml | kubectl apply -f -
+
+                        kubectl create secret generic hrm-database \
+                            --namespace "$K8S_NAMESPACE" \
+                            --from-literal=SPRING_DATASOURCE_URL="$SPRING_DATASOURCE_URL" \
+                            --from-literal=SPRING_DATASOURCE_USERNAME="$SPRING_DATASOURCE_USERNAME" \
+                            --from-literal=SPRING_DATASOURCE_PASSWORD="$SPRING_DATASOURCE_PASSWORD" \
+                            --dry-run=client -o yaml | kubectl apply -f -
+
+                        kubectl create deployment api-gateway \
+                            --image="$ECR_REGISTRY/api-gateway:$IMAGE_TAG" \
+                            --replicas=2 --port=8080 --dry-run=client -o yaml |
+                            kubectl apply --namespace "$K8S_NAMESPACE" -f -
+                        kubectl create deployment employee-service \
+                            --image="$ECR_REGISTRY/employee-service:$IMAGE_TAG" \
+                            --replicas=2 --port=8096 --dry-run=client -o yaml |
+                            kubectl apply --namespace "$K8S_NAMESPACE" -f -
+                        kubectl create deployment leave-service \
+                            --image="$ECR_REGISTRY/leave-service:$IMAGE_TAG" \
+                            --replicas=2 --port=8091 --dry-run=client -o yaml |
+                            kubectl apply --namespace "$K8S_NAMESPACE" -f -
+
+                        kubectl expose deployment api-gateway --name=api-gateway \
+                            --type=LoadBalancer --port=80 --target-port=8080 \
+                            --dry-run=client -o yaml |
+                            kubectl apply --namespace "$K8S_NAMESPACE" -f -
+                        kubectl expose deployment employee-service --name=employee-service \
+                            --port=8080 --target-port=8096 --dry-run=client -o yaml |
+                            kubectl apply --namespace "$K8S_NAMESPACE" -f -
+                        kubectl expose deployment leave-service --name=leave-service \
+                            --port=8080 --target-port=8091 --dry-run=client -o yaml |
+                            kubectl apply --namespace "$K8S_NAMESPACE" -f -
+
+                        kubectl set env deployment/employee-service \
+                            --from=secret/hrm-database --namespace "$K8S_NAMESPACE"
+                        kubectl set env deployment/leave-service \
+                            --from=secret/hrm-database --namespace "$K8S_NAMESPACE"
+
+                        kubectl rollout status deployment/api-gateway \
+                            --namespace "$K8S_NAMESPACE" --timeout=5m
+                        kubectl rollout status deployment/employee-service \
+                            --namespace "$K8S_NAMESPACE" --timeout=5m
+                        kubectl rollout status deployment/leave-service \
+                            --namespace "$K8S_NAMESPACE" --timeout=5m
+                        kubectl get services --namespace "$K8S_NAMESPACE"
+                    '''
+                }
+            }
+        }
+    }
+}
